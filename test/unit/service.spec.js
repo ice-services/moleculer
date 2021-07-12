@@ -684,7 +684,7 @@ describe("Test Service class", () => {
 			expect(() => { svc._createMethod("schema", "list"); }).toThrowError("Invalid method definition in 'list' method in 'v2.posts' service!");
 		});
 
-		it("should throw error if action handler is not defined", () => {
+		it("should throw error if method handler is not defined", () => {
 			expect(() => { svc._createMethod({}, "list"); })
 				.toThrowError("Missing method handler on 'list' method in 'v2.posts' service!");
 			expect(() => { svc._createMethod({ handler: null }, "list"); })
@@ -693,7 +693,7 @@ describe("Test Service class", () => {
 				.toThrowError("Missing method handler on 'list' method in 'v2.posts' service!");
 		});
 
-		it("should create action definition from a shorthand handler", () => {
+		it("should create method definition from a shorthand handler", () => {
 			const handler = jest.fn(function(name) {
 				expect(this).toBe(svc);
 				return `Hello ${name}`;
@@ -711,7 +711,7 @@ describe("Test Service class", () => {
 			expect(svc.list("John")).toBe("Hello John");
 		});
 
-		it("should create action definition from a schema", () => {
+		it("should create method definition from a schema", () => {
 			const schema = {
 				uppercase: true,
 				handler: jest.fn(function(name) {

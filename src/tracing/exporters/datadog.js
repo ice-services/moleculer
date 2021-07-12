@@ -1,8 +1,8 @@
 "use strict";
 
+const { executionAsyncResource } = require("async_hooks");
 const _ 					= require("lodash");
 const BaseTraceExporter 	= require("./base");
-const asyncHooks			= require("async_hooks");
 const { isFunction } 		= require("../../utils");
 
 /*
@@ -11,6 +11,7 @@ const { isFunction } 		= require("../../utils");
 
 let DatadogSpanContext;
 let DatadogID;
+let Reference;
 
 /**
  * Datadog Trace Exporter with 'dd-trace'.
@@ -51,6 +52,7 @@ class DatadogTraceExporter extends BaseTraceExporter {
 			const ddTrace = require("dd-trace");
 			DatadogSpanContext = require("dd-trace/packages/dd-trace/src/opentracing/span_context");
 			DatadogID = require("dd-trace/packages/dd-trace/src/id");
+			Reference = require("opentracing").Reference;
 			if (!this.ddTracer) {
 				this.ddTracer = ddTrace.init(_.defaultsDeep(this.opts.tracerOptions, {
 					url: this.opts.agentUrl
@@ -67,6 +69,12 @@ class DatadogTraceExporter extends BaseTraceExporter {
 		}
 
 		this.ddScope = this.ddTracer.scope();
+
+		// Determine which scope implementation is being used by dd tracer.
+		// dd-trace-js defaults to async_resource for node >=14.5 || ^12.19.0, but async_hooks
+		// and async_local_storage can be forced with the `scope` init option
+		this.usesAsyncResource = this.ddScope._ddResourceStore !== undefined;
+		this.usesAsyncLocalStorage = this.ddScope._storage !== undefined;
 
 		const oldGetCurrentTraceID = this.tracer.getCurrentTraceID.bind(this.tracer);
 		this.tracer.getCurrentTraceID = () => {
@@ -121,18 +129,18 @@ class DatadogTraceExporter extends BaseTraceExporter {
 
 		const serviceName = span.service ? span.service.fullName : null;
 
-		let parentCtx;
+		let reference;
 		if (span.parentID) {
-			parentCtx = new DatadogSpanContext({
+			const parentCtx = new DatadogSpanContext({
 				traceId: this.convertID(span.traceID),
-				spanId: this.convertID(span.parentID),
-				parentId: this.convertID(span.parentID)
+				spanId: this.convertID(span.parentID)
 			});
+			reference = new Reference(span.type === "event" ? "follows_from" : "child_of", parentCtx);
 		}
 
 		const ddSpan = this.ddTracer.startSpan(span.name, {
 			startTime: span.startTime,
-			childOf: parentCtx,
+			references: reference ? [reference] : [],
 			tags: this.flattenTags(_.defaultsDeep({}, span.tags, {
 				span: {
 					kind: "server",
@@ -152,18 +160,58 @@ class DatadogTraceExporter extends BaseTraceExporter {
 		sc._traceId = this.convertID(span.traceID);
 		sc._spanId = this.convertID(span.id);
 
-		// Activate span in Datadog tracer
-		const asyncId = asyncHooks.executionAsyncId();
-		this.ddScope._spans = this.ddScope._spans || {};
-		const oldSpan = this.ddScope._spans[asyncId];
+		let deactivate;
 
-		this.ddScope._spans[asyncId] = ddSpan;
+		// If the caller doesn't plan to use the preferred `activate` method,
+		// we need to do our best to activate the span in the dd-trace internals.
+		// In certain situations, this has issues with active spans leaking outside their async scope.
+		if (span.autoActivate) {
+			// Save current active span to restore later
+			const previousSpan = this.ddScope.active();
+			let asyncResource = null;
+
+			// Activate new span in Datadog tracer
+			if (this.usesAsyncResource) {
+				asyncResource = executionAsyncResource();
+				this.ddScope._enter(ddSpan, asyncResource);
+			} else if (this.usesAsyncLocalStorage) {
+				this.ddScope._storage.enterWith(ddSpan);
+			} else {
+				this.ddScope._enter(ddSpan);
+			}
+
+			// Prepare deactivation function for later
+			deactivate = () => {
+				if (this.usesAsyncResource) {
+					this.ddScope._exit(asyncResource);
+					const currentResource = executionAsyncResource();
+					if (currentResource !== asyncResource) {
+						this.ddScope._exit(currentResource);
+						this.ddScope._enter(previousSpan || null, currentResource);
+					}
+				} else if (this.usesAsyncLocalStorage) {
+					this.ddScope._storage.enterWith(previousSpan || null);
+				} else {
+					this.ddScope._exit(previousSpan || null);
+				}
+			};
+		}
 
 		span.meta.datadog = {
 			span: ddSpan,
-			asyncId,
-			oldSpan
+			deactivate
 		};
+	}
+
+	/**
+	 * Activate a span in the scope of a function.
+	 *
+	 * @param {Span} span
+	 * @param {Function} fn
+	 * @returns
+	 */
+	activate(span, fn) {
+		return this.ddScope.activate(span.meta.datadog.span, fn);
 	}
 
 	/**
@@ -186,13 +234,12 @@ class DatadogTraceExporter extends BaseTraceExporter {
 
 		this.addLogs(ddSpan, span.logs);
 
-		ddSpan.finish(span.finishTime);
-
-		if (item.oldSpan) {
-			this.ddScope._spans[item.asyncId] = item.oldSpan;
-		} else {
-			delete this.ddScope._spans[item.asyncId];
+		// Deactivate the span in the context if needed
+		if (item.deactivate) {
+			item.deactivate();
 		}
+
+		ddSpan.finish(span.finishTime);
 	}
 
 	/**
@@ -278,9 +325,11 @@ class DatadogTraceExporter extends BaseTraceExporter {
 	 */
 	convertID(id) {
 		if (id) {
+			// Parse guid as a hex string
 			if (id.indexOf("-") !== -1)
-				return DatadogID(id.replace(/-/g, "").substring(0,16));
-			return DatadogID(id);
+				return DatadogID(id.replace(/-/g, "").substring(0,16), 16);
+			// Otherwise, parse as a decimal string because this is likely an ID from dd-trace
+			return DatadogID(id, 10);
 		}
 
 		return null;

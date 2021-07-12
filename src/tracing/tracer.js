@@ -208,6 +208,27 @@ class Tracer {
 	}
 
 	/**
+	 * Call a function with the provided span activated in the exporters' context
+	 *
+	 * @param {Span} span
+	 * @param {Function} fn
+	 */
+	activate(span, fn) {
+		if (this.exporter) {
+			const handler = this.exporter.reduce((next, exporter) => {
+				if (typeof exporter.activate === "function") {
+					return exporter.activate.bind(exporter, span, next);
+				}
+				return next;
+			}, fn);
+
+			return handler();
+		} else {
+			return fn();
+		}
+	}
+
+	/**
 	 * Invoke Exporter method.
 	 *
 	 * @param {String} method

@@ -54,6 +54,7 @@ class Span {
 
 		this.priority = this.opts.priority != null ? this.opts.priority : 5;
 		this.sampled = this.opts.sampled != null ? this.opts.sampled : this.tracer.shouldSample(this);
+		defProp(this, "autoActivate", this.opts.autoActivate != null ? this.opts.autoActivate : true);
 
 		this.startTime = null;
 		this.startTicks = null;

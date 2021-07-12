@@ -1,20 +1,36 @@
 "use strict";
 
-const asyncHooks			= require("async_hooks");
-
-//jest.mock("dd-trace");
 jest.mock("dd-trace/packages/dd-trace/src/opentracing/span_context");
 jest.mock("dd-trace/packages/dd-trace/src/noop/span_context");
-//jest.mock("dd-trace/src/platform");
 
 const DatadogSpanContext = require("dd-trace/packages/dd-trace/src/opentracing/span_context");
 const DatadogID = require("dd-trace/packages/dd-trace/src/id");
 const ddTrace = require("dd-trace");
+const semver = require("semver");
 
 const fakeTracerScope = {
+	_current: null,
 	_spans: {},
 	_destroy: jest.fn(),
-	active: jest.fn(() => fakeDdSpan)
+	_enter: jest.fn(),
+	_exit: jest.fn(),
+	active: jest.fn(() => fakeTracerScope._current)
+};
+
+const fakeTracerScopeAsyncResource = {
+	__mock__active: null,
+	_ddResourceStore: "store",
+	_enter: jest.fn(),
+	_exit: jest.fn(),
+	active: jest.fn(() => fakeTracerScopeAsyncResource.__mock__active)
+};
+
+const fakeTracerScopeAsyncLocalStorage = {
+	__mock__active: null,
+	_storage: {
+		enterWith: jest.fn((ctx) => fakeTracerScopeAsyncLocalStorage.__mock__active = ctx)
+	},
+	active: jest.fn(() => fakeTracerScopeAsyncLocalStorage.__mock__active)
 };
 
 const fakeSpanContext = {
@@ -44,6 +60,10 @@ const { MoleculerRetryableError } = require("../../../../src/errors");
 const broker = new ServiceBroker({ logger: false });
 
 describe("Test Datadog tracing exporter class", () => {
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+	});
 
 	describe("Test Constructor", () => {
 
@@ -199,12 +219,13 @@ describe("Test Datadog tracing exporter class", () => {
 		exporter.init(fakeTracer);
 
 		it("should convert normal span to Datadog span without parentID", () => {
+			fakeTracerScope._current = null;
+
 			const span = {
 				name: "Test Span",
 				id: "abc-12345678901234567890",
 				type: "custom",
 				traceID: "cde-12345678901234567890",
-				//parentID: "def-12345678901234567890",
 
 				service: {
 					fullName: "v1.posts"
@@ -229,7 +250,7 @@ describe("Test Datadog tracing exporter class", () => {
 			expect(exporter.ddTracer.startSpan).toHaveBeenCalledTimes(1);
 			expect(exporter.ddTracer.startSpan).toHaveBeenCalledWith("Test Span", {
 				startTime: 1000,
-				childOf: undefined,
+				references: [],
 				tags: {
 					a: 5,
 					b: "John",
@@ -250,30 +271,21 @@ describe("Test Datadog tracing exporter class", () => {
 
 			expect(fakeDdSpan.context).toHaveBeenCalledTimes(1);
 
-			//expect(fakeSpanContext._traceId).toBeInstanceOf("Identifier");
-			//expect(fakeSpanContext._spanId).toBeInstanceOf(DatadogID.Identifier);
-
 			expect(fakeSpanContext._traceId.toString()).toEqual("cde1234567890123");
 			expect(fakeSpanContext._spanId.toString()).toEqual("abc1234567890123");
 
 			expect(span.meta.datadog).toEqual({
 				span: fakeDdSpan,
-				asyncId: asyncHooks.executionAsyncId(),
-				oldSpan: undefined
 			});
 
 		});
 
 		it("should convert normal span to Datadog span with parentID, env & logs", () => {
-			exporter.ddTracer.startSpan.mockClear();
-			fakeDdSpan.context.mockClear();
-			fakeDdSpan.setTag.mockClear();
-			DatadogSpanContext.mockClear();
 			exporter.convertID = jest.fn(id => id);
 			exporter.opts.env = "testing";
 
 			const fakeOldSpan = { name: "old-span" };
-			fakeTracerScope._spans[asyncHooks.executionAsyncId()] = fakeOldSpan;
+			fakeTracerScope._current = fakeOldSpan;
 
 			const span = {
 				name: "Test Span",
@@ -310,11 +322,13 @@ describe("Test Datadog tracing exporter class", () => {
 			expect(exporter.ddTracer.startSpan).toHaveBeenCalledTimes(1);
 			expect(exporter.ddTracer.startSpan).toHaveBeenCalledWith("Test Span", {
 				startTime: 1000,
-				childOf: {
-					parentId: "ccc-12345678901234567890",
-					spanId: "ccc-12345678901234567890",
-					traceId: "bbb-12345678901234567890",
-				},
+				references: [{
+					_type: "child_of",
+					_referencedContext: {
+						spanId: "ccc-12345678901234567890",
+						traceId: "bbb-12345678901234567890",
+					},
+				}],
 				tags: {
 					a: 5,
 					b: "John",
@@ -338,7 +352,6 @@ describe("Test Datadog tracing exporter class", () => {
 
 			expect(DatadogSpanContext).toHaveBeenCalledTimes(1);
 			expect(DatadogSpanContext).toHaveBeenCalledWith({
-				parentId: "ccc-12345678901234567890",
 				spanId: "ccc-12345678901234567890",
 				traceId: "bbb-12345678901234567890",
 			});
@@ -348,9 +361,304 @@ describe("Test Datadog tracing exporter class", () => {
 
 			expect(span.meta.datadog).toEqual({
 				span: fakeDdSpan,
-				asyncId: asyncHooks.executionAsyncId(),
-				oldSpan: fakeOldSpan
 			});
+		});
+
+		it("should set the parent of an event span as a FollowsFrom reference", async () => {
+			exporter.convertID = jest.fn(id => id);
+			exporter.opts.env = "testing";
+
+			const span = {
+				name: "Test Event Span",
+				type: "event",
+				id: "aaa-12345678901234567890",
+				traceID: "bbb-12345678901234567890",
+				parentID: "ccc-12345678901234567890",
+				service: {
+					fullName: "v1.posts"
+				},
+				startTime: 1230,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+
+			expect(exporter.ddTracer.startSpan).toHaveBeenCalledTimes(1);
+			expect(exporter.ddTracer.startSpan).toHaveBeenCalledWith("Test Event Span", {
+				startTime: 1230,
+				references: [{
+					_type: "follows_from",
+					_referencedContext: {
+						spanId: "ccc-12345678901234567890",
+						traceId: "bbb-12345678901234567890",
+					},
+				}],
+				tags: {
+					def: "ault",
+					type: "event",
+					resource: undefined,
+					"sampling.priority": "AUTO_KEEP",
+					"span.kind": "server",
+					"span.type": "event"
+				}
+			});
+		});
+	});
+
+	describe("Test spanStarted method auto activate with async_hooks scope", () => {
+		const fakeTracer = {
+			broker,
+			logger: broker.logger,
+			opts: {
+				errorFields: ["name", "message", "retryable", "data", "code"]
+			},
+			getCurrentTraceID: jest.fn(),
+			getActiveSpanID: jest.fn(),
+		};
+		const exporter = new DatadogTraceExporter({
+			tracer: fakeDdTracer
+		});
+		exporter.init(fakeTracer);
+
+		it("should activate span using async_hooks implementation", () => {
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+
+			expect(fakeTracerScope._enter).toHaveBeenCalledTimes(1);
+			expect(fakeTracerScope._enter).toHaveBeenCalledWith(fakeDdSpan);
+
+			expect(span.meta.datadog).toEqual({
+				span: fakeDdSpan,
+				deactivate: expect.any(Function)
+			});
+		});
+
+		it("should create a deactivation handler with a previous span", () => {
+			const previousSpan = { name: "previous" };
+			fakeTracerScope._current = previousSpan;
+
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+			span.meta.datadog.deactivate();
+
+			expect(fakeTracerScope._exit).toHaveBeenCalledTimes(1);
+			expect(fakeTracerScope._exit).toHaveBeenCalledWith(previousSpan);
+		});
+
+		it("should create a deactivation handler without a previous span", () => {
+			fakeTracerScope._current = null;
+
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+			span.meta.datadog.deactivate();
+
+			expect(fakeTracerScope._exit).toHaveBeenCalledTimes(1);
+			expect(fakeTracerScope._exit).toHaveBeenCalledWith(null);
+		});
+	});
+
+	if (semver.satisfies(process.versions.node, ">=14.5 || ^12.19.0")) {
+		describe("Test spanStarted method auto activate with async_resource scope", () => {
+			const fakeTracer = {
+				broker,
+				logger: broker.logger,
+				opts: {
+					errorFields: ["name", "message", "retryable", "data", "code"]
+				},
+				getCurrentTraceID: jest.fn(),
+				getActiveSpanID: jest.fn(),
+			};
+			const fakeDdTracer = {
+				scope: jest.fn(() => fakeTracerScopeAsyncResource),
+				startSpan: jest.fn(() => fakeDdSpan)
+			};
+			const exporter = new DatadogTraceExporter({
+				tracer: fakeDdTracer
+			});
+			exporter.init(fakeTracer);
+
+			it("should activate span using async_resource implementation", () => {
+				const span = {
+					name: "Test Span",
+					id: "abc-1",
+					type: "custom",
+					traceID: "cde-1",
+					autoActivate: true,
+					startTime: 5500,
+					tags: {},
+					meta: {}
+				};
+
+				exporter.spanStarted(span);
+
+				expect(fakeTracerScopeAsyncResource._enter).toHaveBeenCalledTimes(1);
+				expect(fakeTracerScopeAsyncResource._enter).toHaveBeenCalledWith(fakeDdSpan, expect.any(Object));
+
+				expect(span.meta.datadog).toEqual({
+					span: fakeDdSpan,
+					deactivate: expect.any(Function)
+				});
+			});
+
+			it("should create a deactivation handler with a previous span", () => {
+				const previousSpan = { name: "previous" };
+				fakeTracerScopeAsyncResource.__mock__active = previousSpan;
+
+				const span = {
+					name: "Test Span",
+					id: "abc-1",
+					type: "custom",
+					traceID: "cde-1",
+					autoActivate: true,
+					startTime: 5500,
+					tags: {},
+					meta: {}
+				};
+
+				exporter.spanStarted(span);
+				span.meta.datadog.deactivate();
+
+				expect(fakeTracerScopeAsyncResource._exit).toHaveBeenCalledTimes(1);
+				expect(fakeTracerScopeAsyncResource._exit).toHaveBeenCalledWith(expect.any(Object));
+			});
+
+			it("should create a deactivation handler without a previous span", () => {
+				fakeTracerScopeAsyncResource.__mock__active = null;
+
+				const span = {
+					name: "Test Span",
+					id: "abc-1",
+					type: "custom",
+					traceID: "cde-1",
+					autoActivate: true,
+					startTime: 5500,
+					tags: {},
+					meta: {}
+				};
+
+				exporter.spanStarted(span);
+				span.meta.datadog.deactivate();
+
+				expect(fakeTracerScopeAsyncResource._exit).toHaveBeenCalledTimes(1);
+				expect(fakeTracerScopeAsyncResource._exit).toHaveBeenCalledWith(expect.any(Object));
+			});
+		});
+	}
+
+	describe("Test spanStarted method auto activate with async_local_storage scope", () => {
+		const fakeTracer = {
+			broker,
+			logger: broker.logger,
+			opts: {
+				errorFields: ["name", "message", "retryable", "data", "code"]
+			},
+			getCurrentTraceID: jest.fn(),
+			getActiveSpanID: jest.fn(),
+		};
+		const fakeDdTracer = {
+			scope: jest.fn(() => fakeTracerScopeAsyncLocalStorage),
+			startSpan: jest.fn(() => fakeDdSpan)
+		};
+		const exporter = new DatadogTraceExporter({
+			tracer: fakeDdTracer
+		});
+		exporter.init(fakeTracer);
+
+		it("should activate span using async_local_storage implementation", () => {
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenCalledTimes(1);
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenCalledWith(fakeDdSpan);
+
+			expect(span.meta.datadog).toEqual({
+				span: fakeDdSpan,
+				deactivate: expect.any(Function)
+			});
+		});
+
+		it("should create a deactivation handler with a previous span", () => {
+			const previousSpan = { name: "previous" };
+			fakeTracerScopeAsyncLocalStorage.__mock__active = previousSpan;
+
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+			span.meta.datadog.deactivate();
+
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenCalledTimes(2);
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenNthCalledWith(2, previousSpan);
+		});
+
+		it("should create a deactivation handler without a previous span", () => {
+			fakeTracerScopeAsyncLocalStorage.__mock__active = null;
+
+			const span = {
+				name: "Test Span",
+				id: "abc-1",
+				type: "custom",
+				traceID: "cde-1",
+				autoActivate: true,
+				startTime: 5500,
+				tags: {},
+				meta: {}
+			};
+
+			exporter.spanStarted(span);
+			span.meta.datadog.deactivate();
+
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenCalledTimes(2);
+			expect(fakeTracerScopeAsyncLocalStorage._storage.enterWith).toHaveBeenNthCalledWith(2, null);
 		});
 	});
 
@@ -384,8 +692,7 @@ describe("Test Datadog tracing exporter class", () => {
 				meta: {
 					datadog: {
 						span: fakeDdSpan,
-						asyncId: asyncHooks.executionAsyncId(),
-						oldSpan: undefined
+						deactivate: jest.fn()
 					}
 				}
 			};
@@ -399,6 +706,8 @@ describe("Test Datadog tracing exporter class", () => {
 
 			expect(fakeDdSpan.finish).toHaveBeenCalledTimes(1);
 			expect(fakeDdSpan.finish).toHaveBeenCalledWith(1050);
+
+			expect(span.meta.datadog.deactivate).toHaveBeenCalledTimes(1);
 		});
 
 		it("should finish with error", () => {
@@ -406,9 +715,6 @@ describe("Test Datadog tracing exporter class", () => {
 			fakeTracerScope._destroy.mockClear();
 			exporter.addTags = jest.fn();
 			exporter.addLogs = jest.fn();
-
-			const fakeOldSpan = { name: "old-span" };
-			fakeTracerScope._spans[asyncHooks.executionAsyncId()] = null;
 
 			const err = new MoleculerRetryableError("Something happened", 512, "SOMETHING", { a: 5 });
 
@@ -421,9 +727,7 @@ describe("Test Datadog tracing exporter class", () => {
 
 				meta: {
 					datadog: {
-						span: fakeDdSpan,
-						asyncId: asyncHooks.executionAsyncId(),
-						oldSpan: fakeOldSpan
+						span: fakeDdSpan
 					}
 				}
 			};
@@ -444,10 +748,6 @@ describe("Test Datadog tracing exporter class", () => {
 
 			expect(fakeDdSpan.finish).toHaveBeenCalledTimes(1);
 			expect(fakeDdSpan.finish).toHaveBeenCalledWith(1050);
-
-			expect(fakeTracerScope._spans[asyncHooks.executionAsyncId()]).toBe(fakeOldSpan);
-
-			expect(fakeTracerScope._destroy).toHaveBeenCalledTimes(0);
 		});
 	});
 
@@ -560,21 +860,28 @@ describe("Test Datadog tracing exporter class", () => {
 		const exporter = new DatadogTraceExporter({});
 		exporter.init(fakeTracer);
 
-		it("should truncate ID", () => {
-			expect(exporter.convertID()).toBeNull();
-			expect(exporter.convertID("")).toBeNull();
-			expect(exporter.convertID("12345678").toString()).toEqual("12345678");
+		it("should truncate or expand hex IDs to 16 characters", () => {
 			expect(exporter.convertID("123456789-0123456").toString()).toEqual("1234567890123456");
 			expect(exporter.convertID("123456789-0123456789-abcdef").toString()).toEqual("1234567890123456");
-			expect(exporter.convertID("abc-def").toString()).toEqual("abcdef");
+			expect(exporter.convertID("abc-def").toString()).toEqual("0000000000abcdef");
 			expect(exporter.convertID("abc-def-abc-def-abc-def").toString()).toEqual("abcdefabcdefabcd");
 		});
 
+		it("should pass through a numeric string ID", () => {
+			expect(exporter.convertID("12345678").toString(10)).toEqual("12345678");
+			expect(exporter.convertID("1234567890123456").toString(10)).toEqual("1234567890123456");
+		});
+
+		it("should pass through empty input", () => {
+			expect(exporter.convertID()).toBeNull();
+			expect(exporter.convertID("")).toBeNull();
+		});
 	});
 
 	describe("Test wrapped getCurrentTraceID method", () => {
 
 		it("should retun with the original traceID", () => {
+			fakeTracerScope._current = fakeDdSpan;
 			let oldGetCurrentTraceID = jest.fn(() => "old-trace-id");
 			const fakeTracer = {
 				broker,
@@ -592,7 +899,7 @@ describe("Test Datadog tracing exporter class", () => {
 		});
 
 		it("should retun with the original traceID", () => {
-			fakeDdSpan.context.mockClear();
+			fakeTracerScope._current = fakeDdSpan;
 			let oldGetCurrentTraceID = jest.fn();
 			const fakeTracer = {
 				broker,
@@ -618,6 +925,7 @@ describe("Test Datadog tracing exporter class", () => {
 	describe("Test wrapped getActiveSpanID method", () => {
 
 		it("should retun with the original spanID", () => {
+			fakeTracerScope._current = fakeDdSpan;
 			let oldGetActiveSpanID = jest.fn(() => "old-trace-id");
 			const fakeTracer = {
 				broker,
@@ -635,8 +943,7 @@ describe("Test Datadog tracing exporter class", () => {
 		});
 
 		it("should retun with the original spanID", () => {
-			fakeDdSpan.context.mockClear();
-			fakeTracerScope.active.mockClear();
+			fakeTracerScope._current = fakeDdSpan;
 
 			let oldGetActiveSpanID = jest.fn();
 			const fakeTracer = {

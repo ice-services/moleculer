@@ -140,6 +140,12 @@ class Context {
 		else if (opts.parentCtx != null && opts.parentCtx.requestID != null)
 			ctx.requestID = opts.parentCtx.requestID;
 
+		// TraceID
+		if (opts.traceID != null)
+			ctx.traceID = opts.traceID;
+		else if (opts.parentCtx != null && opts.parentCtx.traceID != null)
+			ctx.traceID = opts.parentCtx.traceID;
+
 		// Meta
 		if (opts.parentCtx != null && opts.parentCtx.meta != null)
 			ctx.meta = Object.assign({}, opts.parentCtx.meta || {}, opts.meta || {});
@@ -169,6 +175,7 @@ class Context {
 		if (opts.parentSpan != null) {
 			ctx.parentID = opts.parentSpan.id;
 			ctx.requestID = opts.parentSpan.traceID;
+			ctx.traceID = opts.parentSpan.traceID;
 			ctx.tracing = opts.parentSpan.sampled;
 		}
 
@@ -198,6 +205,7 @@ class Context {
 		newCtx.meta = this.meta;
 		newCtx.locals = this.locals;
 		newCtx.requestID = this.requestID;
+		newCtx.traceID = this.traceID;
 		newCtx.tracing = this.tracing;
 		newCtx.span = this.span;
 		newCtx.needAck = this.needAck;
@@ -459,6 +467,7 @@ class Context {
 			"meta",
 			//"locals",
 			"requestID",
+			"traceID",
 			"tracing",
 			"span",
 			"needAck",
