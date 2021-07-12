@@ -771,8 +771,12 @@ class Service {
 	 * @param {String|Number?} version
 	 */
 	static getVersionedFullName(name, version) {
-		if (version != null)
-			return (typeof(version) == "number" ? "v" + version : version) + "." + name;
+		if (version != null) {
+			if (typeof(version) === 'number' || !isNaN(Number(version))) {
+				return `v${version}.${name}`;
+			}
+			return `${version}.${name}`;
+		}
 
 		return name;
 	}
